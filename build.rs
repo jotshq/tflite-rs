@@ -1,7 +1,10 @@
 #[cfg(feature = "generate_model_apis")]
 #[macro_use]
 extern crate bart_derive;
+//extern crate cmake;
 
+#[cfg(feature = "build")]
+use cmake::Config;
 use std::env;
 use std::env::VarError;
 use std::path::{Path, PathBuf};
@@ -16,47 +19,9 @@ fn submodules() -> PathBuf {
     manifest_dir().join("submodules")
 }
 
-#[cfg(feature = "build")]
-fn prepare_tensorflow_source() -> PathBuf {
-    println!("Moving tflite source");
-    let start = Instant::now();
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let tf_src_dir = out_dir.join("tensorflow/tensorflow");
-    let submodules = submodules();
-
-    let mut copy_dir = fs_extra::dir::CopyOptions::new();
-    copy_dir.overwrite = true;
-    copy_dir.buffer_size = 65536;
-
-    if !tf_src_dir.exists() {
-        fs_extra::dir::copy(submodules.join("tensorflow"), &out_dir, &copy_dir)
-            .expect("Unable to copy tensorflow");
-    }
-
-    let download_dir = tf_src_dir.join("lite/tools/make/downloads");
-    if !download_dir.exists() {
-        fs_extra::dir::copy(
-            submodules.join("downloads"),
-            download_dir.parent().unwrap(),
-            &copy_dir,
-        )
-        .expect("Unable to copy download dir");
-    }
-
-    println!("Moving source took {:?}", start.elapsed());
-
-    tf_src_dir
-}
-
-fn binary_changing_features() -> String {
-    let mut features = String::new();
-    if cfg!(feature = "debug_tflite") {
-        features.push_str("-debug");
-    }
-    if cfg!(feature = "no_micro") {
-        features.push_str("-no_micro");
-    }
-    features
+fn out_dir() -> PathBuf {
+    let out_dir = env::var("OUT_DIR").unwrap();
+    return PathBuf::from(out_dir).canonicalize().unwrap();
 }
 
 fn prepare_tensorflow_library() {
@@ -64,102 +29,29 @@ fn prepare_tensorflow_library() {
 
     #[cfg(feature = "build")]
     {
-        let tflite = prepare_tensorflow_source();
-        let out_dir = env::var("OUT_DIR").unwrap();
-        // append tf_lib_name with features that can change how it is built
-        // so a cached version that doesn't match expectations isn't used
-        let binary_changing_features = binary_changing_features();
-        let tf_lib_name =
-            Path::new(&out_dir).join(format!("libtensorflow-lite{}.a", binary_changing_features,));
-        let os = env::var("CARGO_CFG_TARGET_OS").expect("Unable to get TARGET_OS");
-        if !tf_lib_name.exists() {
-            println!("Building tflite");
-            let start = Instant::now();
-            let mut make = std::process::Command::new("make");
-            if let Ok(prefix) = env::var("TARGET_TOOLCHAIN_PREFIX") {
-                make.arg(format!("TARGET_TOOLCHAIN_PREFIX={}", prefix));
-            };
-            // Use cargo's cross-compilation information while building tensorflow
-            // Now that tensorflow has an aarch64_makefile.inc use theirs
-            let target = if &arch == "aarch64" { &arch } else { &os };
+        println!("Building tflite");
+        let start = Instant::now();
+        let lite_path = submodules().join("tensorflow/tensorflow/lite");
 
-            #[cfg(feature = "debug_tflite")]
-            {
-                println!("Feature debug_tflite enabled. Changing optimization to 0");
-                let makefile = tflite.join("lite/tools/make/Makefile");
-                let makefile_contents =
-                    std::fs::read_to_string(&makefile).expect("Unable to read Makefile");
-                let replaced = makefile_contents.replace("-O3", "-Og -g").replace("-DNDEBUG", "");
-                std::fs::write(&makefile, &replaced).expect("Unable to write Makefile");
-                if !replaced.contains("-Og") {
-                    panic!("Unable to change optimization settings");
-                }
-            }
+        let build_config = &mut Config::new(lite_path);
 
-            let make_dir = tflite.parent().unwrap();
+        build_config.define("CMAKE_BUILD_TYPE", "Release");
+        // build_config.define("TFLITE_ENABLE_RUY", "OFF");
+        build_config.define("BUILD_SHARED_LIBS", "OFF");
+        build_config.define("TFLITE_ENABLE_INSTALL", "ON");
+        //build_config.define("TFLITE_ENABLE_RUY", "OFF");
 
-            make.arg("-j")
-                // allow parallelism to be overridden
-                .arg(
-                    env::var("TFLITE_RS_MAKE_PARALLELISM").unwrap_or_else(|_| {
-                        env::var("NUM_JOBS").unwrap_or_else(|_| "1".to_string())
-                    }),
-                )
-                .arg("BUILD_WITH_NNAPI=false")
-                .arg("-f")
-                .arg("tensorflow/lite/tools/make/Makefile");
-
-            for (make_var, default) in &[
-                ("TARGET", Some(target.as_str())),
-                ("TARGET_ARCH", Some(arch.as_str())),
-                ("TARGET_TOOLCHAIN_PREFIX", None),
-                ("EXTRA_CFLAGS", None),
-            ] {
-                let env_var = format!("TFLITE_RS_MAKE_{}", make_var);
-                println!("cargo:rerun-if-env-changed={}", env_var);
-
-                match env::var(&env_var) {
-                    Ok(result) => {
-                        make.arg(format!("{}={}", make_var, result));
-                    }
-                    Err(VarError::NotPresent) => {
-                        // Try and set some reasonable default values
-                        if let Some(result) = default {
-                            make.arg(format!("{}={}", make_var, result));
-                        }
-                    }
-                    Err(VarError::NotUnicode(_)) => {
-                        panic!("Provided a non-unicode value for {}", env_var)
-                    }
-                }
-            }
-
-            if cfg!(feature = "no_micro") {
-                println!("Building lib but no micro");
-                make.arg("lib");
-            } else {
-                make.arg("micro");
-            }
-            make.current_dir(make_dir);
-            eprintln!("make command = {:?} in dir  {:?}", make, make_dir);
-            if !make.status().expect("failed to run make command").success() {
-                panic!("Failed to build tensorflow");
-            }
-
-            // find library
-            let library = std::fs::read_dir(tflite.join("lite/tools/make/gen"))
-                .expect("Make gen file should exist")
-                .filter_map(|de| Some(de.ok()?.path().join("lib/libtensorflow-lite.a")))
-                .find(|p| p.exists())
-                .expect("Unable to find libtensorflow-lite.a");
-            std::fs::copy(&library, &tf_lib_name).unwrap_or_else(|_| {
-                panic!("Unable to copy libtensorflow-lite.a to {}", tf_lib_name.display())
-            });
-
-            println!("Building tflite from source took {:?}", start.elapsed());
+        #[cfg(feature = "debug_tflite")]
+        {
+            build_config.define("CMAKE_BUILD_TYPE", "Debug");
         }
-        println!("cargo:rustc-link-search=native={}", out_dir);
-        println!("cargo:rustc-link-lib=static=tensorflow-lite{}", binary_changing_features);
+
+        let dst = build_config.build();
+        println!("Built: {}", dst.display());
+
+        println!("Building tflite from source took {:?}", start.elapsed());
+        println!("cargo:rustc-link-search=native={}", dst.display());
+        println!("cargo:rustc-link-lib=static=tensorflow-lite");
     }
     #[cfg(not(feature = "build"))]
     {
@@ -189,6 +81,7 @@ fn import_tflite_types() {
     use bindgen::*;
 
     let submodules = submodules();
+
     let submodules_str = submodules.to_string_lossy();
     let bindings = Builder::default()
         .whitelist_recursively(true)
@@ -225,12 +118,12 @@ fn import_tflite_types() {
         .derive_eq(true)
         .header("csrc/tflite_wrapper.hpp")
         .clang_arg(format!("-I{}/tensorflow", submodules_str))
-        .clang_arg(format!("-I{}/downloads/flatbuffers/include", submodules_str))
+        .clang_arg(format!("-I{}", out_dir().join("build/flatbuffers/include/").to_string_lossy()))
         .clang_arg("-DGEMMLOWP_ALLOW_SLOW_SCALAR_FALLBACK")
         .clang_arg("-DFLATBUFFERS_POLYMORPHIC_NATIVETABLE")
         .clang_arg("-x")
         .clang_arg("c++")
-        .clang_arg("-std=c++11")
+        .clang_arg("-std=c++17")
         // required to get cross compilation for aarch64 to work because of an issue in flatbuffers
         .clang_arg("-fms-extensions");
 
@@ -246,7 +139,7 @@ fn build_inline_cpp() {
 
     cpp_build::Config::new()
         .include(submodules.join("tensorflow"))
-        .include(submodules.join("downloads/flatbuffers/include"))
+        .include(out_dir().join("build/flatbuffers/include/"))
         .flag("-fPIC")
         .flag("-std=c++14")
         .flag("-Wno-sign-compare")
@@ -517,9 +410,9 @@ fn main() {
         generate_vector_impl().unwrap();
         generate_builtin_options_impl().unwrap();
     }
-    import_tflite_types();
-    build_inline_cpp();
     if env::var("DOCS_RS").is_err() {
         prepare_tensorflow_library();
     }
+    import_tflite_types();
+    build_inline_cpp();
 }
